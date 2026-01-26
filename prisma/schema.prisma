@@ -1,0 +1,200 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = "mysql://root@localhost:3306/bubuhaniot"
+}
+
+model User {
+  id        String           @id @default(cuid())
+  googleSub String           @unique
+  email     String           @unique
+  name      String?
+  links     UserTenantLink[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Tenant {
+  id         String           @id @default(cuid())
+  tbTenantId String           @unique
+  title      String
+  links      UserTenantLink[]
+  sensors    Sensor[]
+  firmwares  Firmware[]
+  projects   Project[]
+  compileJobs CompileJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserTenantLink {
+  id       String @id @default(cuid())
+  user     User   @relation(fields: [userId], references: [id])
+  userId   String
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  tenantId String
+
+  tbTenantAdminUserId  String @unique
+  // Encrypted with AES-256-GCM using ENCRYPTION_KEY
+  tbServicePasswordEnc String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, tenantId])
+}
+
+model SensorType {
+  id          String  @id @default(cuid())
+  name        String  @unique // e.g., "DHT11", "HC-SR04", "DS18B20"
+  description String?
+  category    String // e.g., "Temperature", "Distance", "Humidity"
+
+  // PIN requirements
+  requiredPins Json // e.g., {"data": "digital", "vcc": "3.3v", "gnd": "ground"}
+
+  // Output specifications
+  outputs SensorOutput[]
+  sensors Sensor[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SensorOutput {
+  id           String     @id @default(cuid())
+  sensorType   SensorType @relation(fields: [sensorTypeId], references: [id], onDelete: Cascade)
+  sensorTypeId String
+
+  name     String // e.g., "temperature", "humidity", "distance"
+  unit     String // e.g., "°C", "%", "cm"
+  dataType String // e.g., "float", "integer", "boolean"
+  minValue Float?
+  maxValue Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Sensor {
+  id           String     @id @default(cuid())
+  name         String
+  sensorType   SensorType @relation(fields: [sensorTypeId], references: [id])
+  sensorTypeId String
+
+  // Device association
+  deviceId   String // ThingsBoard device ID
+  deviceName String // Device name for reference
+
+  // PIN configuration
+  pinMapping Json // e.g., {"data": "21", "vcc": "3.3v", "gnd": "gnd"}
+
+  // Output configuration
+  outputConfig Json // e.g., {"temperature": {"enabled": true, "unit": "C"}, "humidity": {"enabled": true, "unit": "%"}}
+
+  // Custom output format template
+  outputTemplate String? // e.g., "Temperature: {%tempValue}°C, Humidity: {%humdValue}%"
+
+  // Status
+  isActive Boolean @default(true)
+
+  // Tenant association
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  tenantId String
+
+  // Sensor data relationship
+  sensorData SensorData[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([deviceId])
+  @@index([tenantId])
+}
+
+model SensorData {
+  id       String @id @default(cuid())
+  sensor   Sensor @relation(fields: [sensorId], references: [id], onDelete: Cascade)
+  sensorId String
+
+  // Raw sensor values
+  rawData Json // e.g., {"temperature": 25.5, "humidity": 60.2}
+
+  // Formatted output
+  formattedOutput String? // e.g., "Temperature: 25.5°C, Humidity: 60.2%"
+
+  // Metadata
+  timestamp DateTime @default(now())
+  quality   String   @default("GOOD") // GOOD, POOR, BAD
+
+  @@index([sensorId, timestamp])
+}
+
+model Firmware {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  version     String
+  filePath    String
+  fileSize    Int
+  deviceType  String // "ARDUINO_UNO" or "ESP32"
+  isActive    Boolean @default(false)
+
+  // Relation to tenant
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+  tenantId String
+
+  // Relations
+  projects   Project[]
+  compileJobs CompileJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  
+  // Canvas state (JSON blob)
+  canvasData  Json     // { nodes: [...], edges: [...] }
+  
+  // Associated firmware
+  latestFirmwareId String?
+  latestFirmware   Firmware? @relation(fields: [latestFirmwareId], references: [id])
+  
+  // Ownership
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  tenantId    String
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model CompileJob {
+  id          String   @id @default(cuid())
+  status      String   @default("pending") // pending, compiling, uploading, success, failed
+  logs        String?  @db.Text
+  errorMsg    String?
+  
+  // References
+  projectId   String?
+  deviceId    String   // ThingsBoard device ID
+  firmwareId  String?
+  firmware    Firmware? @relation(fields: [firmwareId], references: [id])
+  
+  tenant      Tenant   @relation(fields: [tenantId], references: [id])
+  tenantId    String
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([tenantId, status])
+  @@index([deviceId])
+}
