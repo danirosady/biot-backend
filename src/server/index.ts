@@ -190,7 +190,7 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
       email: user.email,
       name: user.name,
       googleSub: user.googleSub,
-      tenants: user.links.map(link => ({
+      tenants: user.links.map((link: { tenant: { id: string; tbTenantId: string; title: string } }) => ({
         id: link.tenant.id,
         tbTenantId: link.tenant.tbTenantId,
         title: link.tenant.title,
@@ -345,7 +345,7 @@ app.put("/api/devices/:id", authenticateToken, async (req, res) => {
       email: userInfo.email,
       password,
       cacheKey: ensured.tenantAdmin.tbTenantAdminUserId,
-      deviceId: id,
+      deviceId: id as string,
       name,
       type,
       label,
@@ -415,7 +415,7 @@ app.delete("/api/devices/:id", authenticateToken, async (req, res) => {
       email: userInfo.email,
       password,
       cacheKey: ensured.tenantAdmin.tbTenantAdminUserId,
-      deviceId: id,
+      deviceId: id as string,
     });
 
     return res.status(204).end();
@@ -575,7 +575,7 @@ app.get("/api/sensor-types", async (req, res) => {
     });
     
     // Transform requiredPins to pinRequirements for frontend compatibility
-    const transformedSensorTypes = sensorTypes.map(sensorType => ({
+    const transformedSensorTypes = sensorTypes.map((sensorType: { requiredPins: unknown; [key: string]: unknown }) => ({
       ...sensorType,
       pinRequirements: sensorType.requiredPins,
       requiredPins: undefined // Remove the original field
@@ -1088,10 +1088,10 @@ app.get("/api/telemetry/latest", async (req, res) => {
     const token = await tenantLogin(userEmail, password, ensured.tenantAdmin.tbTenantAdminUserId);
 
     const items = await Promise.all(
-      sensors.map(async (sensor) => {
+      sensors.map(async (sensor: { deviceId: string | null; name: string; deviceName: string | null; sensorType: { outputs: Array<{ name: string }> } }) => {
         if (!sensor.deviceId) return null;
         try {
-          const keys = sensor.sensorType.outputs.map((o: any) => `${sensor.name}_${o.name}`);
+          const keys = sensor.sensorType.outputs.map((o) => `${sensor.name}_${o.name}`);
           // include meta keys if present
           const keysParam = keys.join(",");
 

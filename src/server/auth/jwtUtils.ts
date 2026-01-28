@@ -1,5 +1,12 @@
 import jwt, { type SignOptions } from 'jsonwebtoken';
-import { User } from '@prisma/client';
+
+// Define User interface matching Prisma schema
+interface User {
+  id: string;
+  googleSub: string;
+  email: string;
+  name: string | null;
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'your-refresh-secret-change-in-production';

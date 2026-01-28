@@ -1,4 +1,9 @@
-import { User } from '@prisma/client';
+interface User {
+    id: string;
+    googleSub: string;
+    email: string;
+    name: string | null;
+}
 export interface JWTPayload {
     userId: string;
     email: string;
@@ -28,4 +33,5 @@ export declare function verifyRefreshToken(token: string): {
  * Extract token from Authorization header
  */
 export declare function extractTokenFromHeader(authHeader?: string): string | null;
+export {};
 //# sourceMappingURL=jwtUtils.d.ts.map

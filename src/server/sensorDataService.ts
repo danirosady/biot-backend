@@ -127,7 +127,7 @@ export class SensorDataService {
     // Get ThingsBoard data if requested and device is available
     if (query.includeThingsBoard && sensor.deviceId) {
       try {
-        const keys = sensor.sensorType.outputs.map(output => `${sensor.name}_${output.name}`)
+        const keys = sensor.sensorType.outputs.map((output: { name: string }) => `${sensor.name}_${output.name}`)
         
         if (query.aggregation) {
           const startTs = query.startTime?.getTime() || Date.now() - 24 * 60 * 60 * 1000
@@ -202,7 +202,7 @@ export class SensorDataService {
     // Delete from ThingsBoard if requested
     if (options?.deleteFromThingsBoard && sensor.deviceId) {
       try {
-        const keys = sensor.sensorType.outputs.map(output => `${sensor.name}_${output.name}`)
+        const keys = sensor.sensorType.outputs.map((output: { name: string }) => `${sensor.name}_${output.name}`)
         keys.push(`${sensor.name}_formatted`, `${sensor.name}_quality`, `${sensor.name}_timestamp`)
         
         await tb.deleteDeviceTelemetry(
