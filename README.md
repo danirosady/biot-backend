@@ -34,10 +34,10 @@ npm run db:seed
 Create `.env` file (already created with template values):
 
 ```env
-DATABASE_URL=mysql://root@localhost:3306/bubuhaniot
-THINGSBOARD_BASE_URL=http://103.103.20.119:8080
-THINGSBOARD_SYSADMIN_USERNAME=sysadmin@thingsboard.org
-THINGSBOARD_SYSADMIN_PASSWORD=Rahasia.21
+DATABASE_URL=
+THINGSBOARD_BASE_URL=
+THINGSBOARD_SYSADMIN_USERNAME=
+THINGSBOARD_SYSADMIN_PASSWORD=
 ENCRYPTION_KEY=your_32_byte_key_base64
 REDIS_URL=redis://localhost:6379
 ARDUINO_CLI_PATH=arduino-cli
