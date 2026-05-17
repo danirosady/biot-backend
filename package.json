@@ -4,8 +4,8 @@
   "description": "Backend server for Wiring Studio Visual IoT IDE",
   "main": "src/server/index.ts",
   "scripts": {
-    "dev": "tsx src/server/index.ts",
-    "worker": "tsx src/workers/startWorker.ts",
+    "dev": "tsx --no-cache src/server/index.ts",
+    "worker": "tsx --no-cache src/workers/startWorker.ts",
     "build": "tsc",
     "start": "node dist/server/index.js",
     "db:push": "prisma db push",

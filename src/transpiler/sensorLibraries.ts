@@ -3,7 +3,7 @@ export interface SensorConfig {
   library: string;
   arduinoLibName: string; // For arduino-cli lib install
   includeStatement: string;
-  initCode: (pinMapping: Record<string, string>) => string;
+  initCode: (varName: string, pinMapping: Record<string, string>) => string;
   setupCode: (varName: string) => string;
   loopCode: (varName: string) => string;
   telemetryKeys: string[];
@@ -17,9 +17,9 @@ export const SENSOR_LIBRARIES: Record<string, SensorConfig> = {
     includeStatement: '#include <DHT.h>',
     pinRequirements: ['VCC', 'GND', 'DATA'],
     telemetryKeys: ['temperature', 'humidity'],
-    initCode: (pinMapping) => {
+    initCode: (varName, pinMapping) => {
       const dataPin = pinMapping.DATA?.replace('D', '') || '4';
-      return `DHT dht(${dataPin}, DHT11);`;
+      return `DHT dht(${dataPin}, DHT11);\nDHT &dht111 = dht;`;
     },
     setupCode: (varName) => `  ${varName}.begin();`,
     loopCode: (varName) => `
@@ -42,10 +42,10 @@ export const SENSOR_LIBRARIES: Record<string, SensorConfig> = {
     includeStatement: '#include <Ultrasonic.h>',
     pinRequirements: ['VCC', 'GND', 'TRIG', 'ECHO'],
     telemetryKeys: ['distance'],
-    initCode: (pinMapping) => {
+    initCode: (varName, pinMapping) => {
       const trigPin = pinMapping.TRIG?.replace('D', '') || '5';
       const echoPin = pinMapping.ECHO?.replace('D', '') || '18';
-      return `Ultrasonic ultrasonic(${trigPin}, ${echoPin});`;
+      return `Ultrasonic ${varName}(${trigPin}, ${echoPin});`;
     },
     setupCode: () => '',
     loopCode: (varName) => `
@@ -65,9 +65,10 @@ export const SENSOR_LIBRARIES: Record<string, SensorConfig> = {
     includeStatement: '#include <OneWire.h>\n#include <DallasTemperature.h>',
     pinRequirements: ['VCC', 'GND', 'DATA'],
     telemetryKeys: ['temperature'],
-    initCode: (pinMapping) => {
+    initCode: (varName, pinMapping) => {
       const dataPin = pinMapping.DATA?.replace('D', '') || '4';
-      return `OneWire oneWire(${dataPin});\nDallasTemperature ds18b20(&oneWire);`;
+      const oneWireVar = `${varName}OneWire`;
+      return `OneWire ${oneWireVar}(${dataPin});\nDallasTemperature ${varName}(&${oneWireVar});`;
     },
     setupCode: (varName) => `  ${varName}.begin();`,
     loopCode: (varName) => `
@@ -88,19 +89,26 @@ export const SENSOR_LIBRARIES: Record<string, SensorConfig> = {
     includeStatement: '',
     pinRequirements: ['VCC', 'GND', 'AOUT'],
     telemetryKeys: ['moisture'],
-    initCode: (pinMapping) => {
+    initCode: (varName, pinMapping) => {
       const analogPin = pinMapping.AOUT?.replace('A', '') || '0';
-      return `const int SOIL_PIN = A${analogPin};`;
+      const pinVar = `${varName.toUpperCase()}_PIN`;
+      return `const int ${pinVar} = A${analogPin};`;
     },
-    setupCode: () => `  pinMode(SOIL_PIN, INPUT);`,
-    loopCode: () => `
+    setupCode: (varName) => {
+      const pinVar = `${varName.toUpperCase()}_PIN`;
+      return `  pinMode(${pinVar}, INPUT);`;
+    },
+    loopCode: (varName) => {
+      const pinVar = `${varName.toUpperCase()}_PIN`;
+      return `
   // Read Soil Moisture sensor
-  int soilValue = analogRead(SOIL_PIN);
+  int soilValue = analogRead(${pinVar});
   float moisture = map(soilValue, 0, 4095, 0, 100); // Convert to percentage
   
   Serial.print("Soil Moisture: ");
   Serial.print(moisture);
-  Serial.println("%");`,
+  Serial.println("%");`;
+    },
   },
 };
 

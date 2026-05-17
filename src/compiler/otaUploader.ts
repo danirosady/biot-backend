@@ -48,15 +48,8 @@ export class OtaUploader {
       const fileStats = await fs.stat(config.binPath);
       const fileName = path.basename(config.binPath);
 
-      // 3. Create OTA package
-      const formData = new FormData();
-      formData.append('file', firmwareBuffer, {
-        filename: fileName,
-        contentType: 'application/octet-stream',
-      });
-      
-      // Add package metadata
-      const packageData = {
+      // 3. Create OTA package info (JSON metadata only)
+      const packageInfoPayload = {
         title: config.title || `Firmware ${config.version}`,
         version: config.version,
         deviceProfileId: {
@@ -67,28 +60,56 @@ export class OtaUploader {
         description: config.description || 'Auto-generated firmware from Wiring Studio',
       };
 
-      formData.append('data', JSON.stringify(packageData));
-
-      // 4. Upload to ThingsBoard
-      const uploadResponse = await axios.post(
+      const infoResponse = await axios.post(
         `${this.tbBaseUrl}/api/otaPackage`,
-        formData,
+        packageInfoPayload,
         {
           headers: {
-            ...formData.getHeaders(),
             'Authorization': `Bearer ${config.tbToken}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+        }
+      );
+
+      const packageId = infoResponse.data?.id?.id;
+      if (!packageId) {
+        throw new Error('Failed to create OTA package info');
+      }
+
+      // 4. Upload OTA package data (binary file) to created package id
+      const formData = new FormData();
+      formData.append('file', firmwareBuffer, {
+        filename: fileName,
+        contentType: 'application/octet-stream',
+      });
+
+      const boundary = (formData as any).getBoundary?.();
+      const multipartBody = (formData as any).getBuffer?.();
+      if (!boundary || !multipartBody) {
+        throw new Error('Failed to build multipart form body for OTA upload');
+      }
+
+      const multipartHeaders: Record<string, string> = {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': String(multipartBody.length),
+      };
+
+      await axios.post(
+        `${this.tbBaseUrl}/api/otaPackage/${packageId}?checksumAlgorithm=SHA256`,
+        multipartBody,
+        {
+          headers: {
+            ...multipartHeaders,
+            'Authorization': `Bearer ${config.tbToken}`,
+            'Accept': 'application/json',
           },
           maxBodyLength: Infinity,
           maxContentLength: Infinity,
         }
       );
 
-      const packageId = uploadResponse.data.id?.id;
-      if (!packageId) {
-        throw new Error('Failed to create OTA package');
-      }
-
-      console.log('OTA package created:', packageId);
+      console.log('OTA package created and data uploaded:', packageId);
 
       // 5. Assign firmware to device
       await this.assignFirmwareToDevice(
@@ -105,14 +126,12 @@ export class OtaUploader {
       };
 
     } catch (error: any) {
-      console.error('OTA upload failed:', error.message);
-      if (error.response) {
-        console.error('Response:', error.response.data);
-      }
+      const details = this.formatAxiosError(error);
+      console.error('OTA upload failed:', details);
       
       return {
         success: false,
-        error: error.message,
+        error: details,
       };
     }
   }
@@ -138,6 +157,33 @@ export class OtaUploader {
     packageId: string,
     token: string
   ): Promise<void> {
+    const headers = { Authorization: `Bearer ${token}` };
+    const allowLegacyFallback = (process.env.TB_LEGACY_ASSIGN_FALLBACK || 'false').toLowerCase() === 'true';
+
+    // Preferred ThingsBoard endpoint for assigning OTA package to device.
+    try {
+      await axios.post(
+        `${this.tbBaseUrl}/api/otaPackage/${packageId}/assign/${deviceId}`,
+        {},
+        { headers }
+      );
+      return;
+    } catch (primaryError: any) {
+      const primaryDetails = this.formatAxiosError(primaryError);
+      const status = primaryError?.response?.status;
+      // Some ThingsBoard distributions do not expose assign endpoint.
+      // In this case, package upload is still valid and can be used by OTA checks.
+      if (status === 404) {
+        console.warn(`Assign endpoint not available on server, skipping device assignment: ${primaryDetails}`);
+        return;
+      }
+      if (!allowLegacyFallback) {
+        throw new Error(`Failed to assign OTA package with modern endpoint: ${primaryDetails}`);
+      }
+      console.warn('Primary OTA assign endpoint failed, trying legacy endpoint:', primaryDetails);
+    }
+
+    // Legacy fallback endpoint.
     await axios.post(
       `${this.tbBaseUrl}/api/device/${deviceId}/firmware`,
       {
@@ -146,10 +192,21 @@ export class OtaUploader {
           id: packageId,
         },
       },
-      {
-        headers: { Authorization: `Bearer ${token}` },
-      }
+      { headers }
     );
+  }
+
+  private formatAxiosError(error: any): string {
+    const status = error?.response?.status;
+    const statusText = error?.response?.statusText;
+    const data = error?.response?.data;
+    const method = error?.config?.method?.toUpperCase?.();
+    const url = error?.config?.url;
+    const base = error?.message || 'Unknown error';
+    const responseInfo = status ? `status=${status}${statusText ? ` ${statusText}` : ''}` : 'no-status';
+    const requestInfo = method && url ? `${method} ${url}` : 'unknown-request';
+    const payload = data ? ` response=${JSON.stringify(data)}` : '';
+    return `${base} [${requestInfo}] [${responseInfo}]${payload}`;
   }
 
   /**

@@ -92,10 +92,12 @@ export function generateArduinoCode(
     const sensorPinMapping = pinMappings[sensorNode.id] || {};
 
     // Generate variable name
-    const varName = sensorType.toLowerCase().replace(/[^a-z0-9]/g, '') + (index + 1);
+    const varName = sensorType === 'DHT11'
+      ? 'dht'
+      : sensorType.toLowerCase().replace(/[^a-z0-9]/g, '') + (index + 1);
 
     // Add initialization code
-    const initCode = sensorConfig.initCode(sensorPinMapping);
+    const initCode = sensorConfig.initCode(varName, sensorPinMapping);
     sensorInits.push(`// ${sensorNode.data.label || sensorType}\n${initCode}`);
 
     // Add setup code

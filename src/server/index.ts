@@ -8,10 +8,10 @@ import { decrypt } from "./crypto";
 import { prisma } from "./prisma";
 import { ensureTenantForGoogleUser } from "./provisioning";
 import { sensorDataService } from './sensorDataService';
-import { tenantCreateDevice, tenantDeleteDevice, tenantGetDeviceInfo, tenantListDevices, tenantUpdateDevice } from "./tbTenant";
-import { getAggregatedTelemetry, getAttributes, getDeviceInfo, getLatestTelemetry, getTelemetryHistory, listDevices } from "./thingsboardClient";
+import { tenantCreateDevice, tenantDeleteDevice, tenantGetDeviceCredentials, tenantGetDeviceInfo, tenantListDevices, tenantSendRpcCommand, tenantUpdateDevice } from "./tbTenant";
+import { getAggregatedTelemetry, getAttributes, getDeviceInfo, getLatestTelemetry, getTelemetryHistory } from "./thingsboardClient";
 import { generateArduinoCode, extractDeviceConfig } from "../transpiler/codeGenerator";
-import { queueCompilationJob, getJobStatus } from "../workers/buildQueue";
+import { queueCompilationJob } from "../workers/buildQueue";
 import { verifyGoogleToken, validateEmailVerified } from "./auth/googleOAuth";
 import { generateTokens, verifyRefreshToken } from "./auth/jwtUtils";
 import { authenticateToken, optionalAuth, getUserFromRequest } from "./auth/authMiddleware";
@@ -78,6 +78,199 @@ app.use(
 );
 
 app.use(express.json());
+app.use(optionalAuth);
+
+// Backward compatibility bridge: older routes still read x-user-* headers.
+app.use((req, _res, next) => {
+  if (req.user) {
+    req.headers["x-user-sub"] = req.headers["x-user-sub"] ?? req.user.googleSub;
+    req.headers["x-user-email"] = req.headers["x-user-email"] ?? req.user.email;
+    if (req.user.name) {
+      req.headers["x-user-name"] = req.headers["x-user-name"] ?? req.user.name;
+    }
+  }
+  next();
+});
+
+type TimeseriesPoint = { ts: number; value: unknown };
+
+function parseQueryString(input: unknown): string | undefined {
+  if (Array.isArray(input)) {
+    const first = input[0];
+    return typeof first === "string" ? first : undefined;
+  }
+  return typeof input === "string" ? input : undefined;
+}
+
+function parseTelemetryValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  const asNumber = Number(trimmed);
+  return Number.isNaN(asNumber) ? value : asNumber;
+}
+
+function normalizeTelemetryRows(
+  deviceId: string,
+  raw: Record<string, TimeseriesPoint[]>
+): Array<Record<string, unknown>> {
+  const rowsByTs = new Map<number, Record<string, unknown>>();
+
+  Object.entries(raw ?? {}).forEach(([key, points]) => {
+    if (!Array.isArray(points)) return;
+    points.forEach((point) => {
+      const ts = Number(point?.ts);
+      if (!Number.isFinite(ts)) return;
+      const existing = rowsByTs.get(ts) ?? { timestamp: ts, deviceId };
+      existing[key] = parseTelemetryValue(point?.value);
+      rowsByTs.set(ts, existing);
+    });
+  });
+
+  return Array.from(rowsByTs.values()).sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+}
+
+function mapCompileStatusForFrontend(status: string): "pending" | "processing" | "completed" | "failed" {
+  switch (status) {
+    case "success":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "pending":
+      return "pending";
+    default:
+      return "processing";
+  }
+}
+
+function mapCompileProgressForFrontend(status: string): number {
+  switch (status) {
+    case "pending":
+      return 5;
+    case "compiling":
+      return 45;
+    case "uploading":
+      return 80;
+    case "success":
+      return 100;
+    case "failed":
+      return 100;
+    default:
+      return 20;
+  }
+}
+
+const LEGACY_FQBN_ALIASES: Record<string, string> = {
+  "esp32:esp32:doit-devkit-v1": "esp32:esp32:esp32doit-devkit-v1",
+};
+
+function normalizeFqbn(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const fqbn = input.trim();
+  if (!fqbn) return null;
+  return LEGACY_FQBN_ALIASES[fqbn] ?? fqbn;
+}
+
+function resolveCompileFqbn(payload: any): string {
+  const candidates = [
+    payload?.boardType,
+    payload?.fqbn,
+    payload?.config?.boardType,
+    payload?.config?.fqbn,
+    process.env.ARDUINO_DEFAULT_FQBN,
+    "esp32:esp32:esp32",
+  ];
+
+  for (const candidate of candidates) {
+    const resolved = normalizeFqbn(candidate);
+    if (resolved) return resolved;
+  }
+
+  return "esp32:esp32:esp32";
+}
+
+function resolveFirmwareVersion(input: unknown): string {
+  const base = typeof input === "string" && input.trim().length > 0 ? input.trim() : "1.0.0";
+  // Keep OTA version unique per deploy to avoid ThingsBoard title+version collision.
+  return `${base}-${Date.now()}`;
+}
+
+const userSettingsStore = new Map<string, any>();
+
+function getDefaultUserSettings(user: { id: string; email: string; name?: string | null }) {
+  return {
+    userId: user.id,
+    email: user.email,
+    name: user.name ?? "",
+    notifications: {
+      email: true,
+      browser: true,
+      deviceAlerts: true,
+      systemUpdates: false,
+    },
+    preferences: {
+      theme: "light",
+      language: "en",
+      timezone: "UTC",
+      dateFormat: "MM/DD/YYYY",
+      temperatureUnit: "celsius",
+    },
+    privacy: {
+      dataRetentionDays: 90,
+      shareAnalytics: false,
+    },
+  };
+}
+
+async function resolveSensorTypeId(input: {
+  sensorTypeId?: unknown;
+  type?: unknown;
+  sensorTypeName?: unknown;
+}): Promise<string | null> {
+  const candidates = [input.sensorTypeId, input.type, input.sensorTypeName]
+    .filter((v): v is string => typeof v === "string" && v.trim().length > 0)
+    .map((v) => v.trim());
+
+  for (const candidate of candidates) {
+    const byId = await prisma.sensorType.findUnique({
+      where: { id: candidate },
+      select: { id: true },
+    });
+    if (byId) return byId.id;
+
+    const byName = await prisma.sensorType.findUnique({
+      where: { name: candidate },
+      select: { id: true },
+    });
+    if (byName) return byName.id;
+  }
+
+  return null;
+}
+
+function toFrontendSensor(sensor: any) {
+  const pinConfig = sensor.pinMapping && typeof sensor.pinMapping === "object" ? sensor.pinMapping : {};
+  const outputConfig = sensor.outputConfig && typeof sensor.outputConfig === "object" ? sensor.outputConfig : {};
+  const sensorTypeName = sensor.sensorType?.name ?? sensor.sensorTypeId;
+
+  return {
+    id: sensor.id,
+    name: sensor.name,
+    type: sensorTypeName,
+    deviceId: sensor.deviceId,
+    label: sensor.deviceName ?? "",
+    additionalInfo: {
+      sensorType: sensorTypeName,
+      pinConfig,
+      outputFormat: sensor.outputTemplate ?? "json",
+      enabled: sensor.isActive !== false,
+      outputConfig,
+    },
+    createdTime: sensor.createdAt ? new Date(sensor.createdAt).getTime() : undefined,
+  };
+}
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
 
@@ -212,6 +405,159 @@ app.post("/api/auth/logout", (req, res) => {
   res.json({ message: "Logged out successfully" });
 });
 
+// Update authenticated user profile
+app.put("/api/auth/profile", authenticateToken, async (req, res) => {
+  try {
+    const { name } = req.body ?? {};
+    const userId = req.user!.userId;
+
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        ...(typeof name === "string" ? { name: name.trim() } : {}),
+      },
+    });
+
+    const existingSettings = userSettingsStore.get(userId);
+    if (existingSettings) {
+      userSettingsStore.set(userId, { ...existingSettings, name: updatedUser.name ?? "" });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        name: updatedUser.name,
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message ?? "Failed to update profile" });
+  }
+});
+
+// Google-auth users do not use local passwords in this backend.
+app.post("/api/auth/change-password", authenticateToken, async (_req, res) => {
+  res.status(400).json({
+    message: "Password change is not available for Google-authenticated accounts.",
+  });
+});
+
+app.post("/api/auth/delete-account", authenticateToken, async (_req, res) => {
+  res.status(400).json({
+    message: "Account deletion is disabled from API. Please contact administrator.",
+  });
+});
+
+app.get("/api/settings", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+      select: { id: true, email: true, name: true },
+    });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const stored = userSettingsStore.get(user.id);
+    const defaults = getDefaultUserSettings(user);
+    const settings = stored
+      ? { ...defaults, ...stored, userId: user.id, email: user.email, name: user.name ?? stored.name ?? "" }
+      : defaults;
+
+    if (!stored) userSettingsStore.set(user.id, settings);
+    res.json(settings);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message ?? "Failed to fetch settings" });
+  }
+});
+
+app.put("/api/settings", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+      select: { id: true, email: true, name: true },
+    });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const defaults = getDefaultUserSettings(user);
+    const current = userSettingsStore.get(user.id) ?? defaults;
+    const payload = req.body ?? {};
+
+    const next = {
+      ...current,
+      notifications: { ...current.notifications, ...(payload.notifications ?? {}) },
+      preferences: { ...current.preferences, ...(payload.preferences ?? {}) },
+      privacy: { ...current.privacy, ...(payload.privacy ?? {}) },
+      userId: user.id,
+      email: user.email,
+      name: user.name ?? current.name ?? "",
+    };
+
+    userSettingsStore.set(user.id, next);
+    res.json(next);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message ?? "Failed to update settings" });
+  }
+});
+
+app.get("/api/settings/export", authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.userId },
+      select: { id: true, email: true, name: true },
+    });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const settings = userSettingsStore.get(user.id) ?? getDefaultUserSettings(user);
+    const exportPayload = {
+      generatedAt: new Date().toISOString(),
+      user: { id: user.id, email: user.email, name: user.name },
+      settings,
+    };
+
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Content-Disposition", `attachment; filename=\"user-data-${Date.now()}.json\"`);
+    res.send(JSON.stringify(exportPayload, null, 2));
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message ?? "Failed to export data" });
+  }
+});
+
+app.get("/api/settings/activity", authenticateToken, async (req, res) => {
+  try {
+    const limitRaw = parseQueryString(req.query.limit);
+    const limit = Math.max(1, Math.min(100, Number(limitRaw ?? 20) || 20));
+
+    const ensured = await ensureTenantForGoogleUser(req.user!.googleSub, req.user!.email, req.user!.name);
+    const jobs = await prisma.compileJob.findMany({
+      where: { tenantId: ensured.tenant.id },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+      select: {
+        id: true,
+        status: true,
+        deviceId: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    const activities = jobs.map((job) => ({
+      id: job.id,
+      timestamp: job.updatedAt.getTime(),
+      action: "Compile Job",
+      description: `Device ${job.deviceId}: ${job.status}`,
+    }));
+
+    res.json({ activities });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message ?? "Failed to fetch activity" });
+  }
+});
+
+app.get("/api/logs", authenticateToken, async (_req, res) => {
+  res.json({ logs: [] });
+});
+
 // Provisioning endpoint: ensure TB tenant/admin for a Google user
 app.post("/api/provision/ensure", async (req, res) => {
   try {
@@ -265,8 +611,6 @@ app.get("/api/devices", authenticateToken, async (req, res) => {
       pageSize,
       type,
     });
-    
-    console.log(`Found ${data.totalElements} device(s) in tenant`);
     
     return res.json(data);
   } catch (e: any) {
@@ -436,7 +780,7 @@ app.get("/api/devices/:id/details", async (req, res) => {
     const userSub = req.header("x-user-sub");
     const userEmail = req.header("x-user-email");
     const userName = req.header("x-user-name") ?? undefined;
-
+    
     if (userSub && userEmail) {
       // Use tenant-specific client
       const ensured = await ensureTenantForGoogleUser(userSub, userEmail, userName);
@@ -459,6 +803,76 @@ app.get("/api/devices/:id/details", async (req, res) => {
     // Fallback to single-tenant client
     const deviceInfo = await getDeviceInfo(id);
     res.json(deviceInfo);
+  } catch (e: any) {
+    const status = e?.response?.status ?? 500;
+    const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
+    res.status(status).json(body);
+  }
+});
+
+// Get device credentials as tenant admin
+app.get("/api/devices/:id/credentials", authenticateToken, async (req, res) => {
+  try {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "Device id is required" });
+
+    const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
+    const link = await prisma.userTenantLink.findFirstOrThrow({
+      where: { tbTenantAdminUserId: ensured.tenantAdmin.tbTenantAdminUserId },
+    });
+    const password = decrypt(link.tbServicePasswordEnc);
+
+    const credentials = await tenantGetDeviceCredentials({
+      email: userInfo.email,
+      password,
+      cacheKey: ensured.tenantAdmin.tbTenantAdminUserId,
+      deviceId: id,
+    });
+
+    res.json(credentials);
+  } catch (e: any) {
+    const status = e?.response?.status ?? 500;
+    const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
+    res.status(status).json(body);
+  }
+});
+
+// Send RPC command as tenant admin
+app.post("/api/devices/:id/rpc", authenticateToken, async (req, res) => {
+  try {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { id } = req.params;
+    const { method, params } = req.body ?? {};
+    if (!id) return res.status(400).json({ error: "Device id is required" });
+    if (!method || typeof method !== "string") {
+      return res.status(400).json({ error: "RPC method is required" });
+    }
+
+    const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
+    const link = await prisma.userTenantLink.findFirstOrThrow({
+      where: { tbTenantAdminUserId: ensured.tenantAdmin.tbTenantAdminUserId },
+    });
+    const password = decrypt(link.tbServicePasswordEnc);
+
+    const result = await tenantSendRpcCommand({
+      email: userInfo.email,
+      password,
+      cacheKey: ensured.tenantAdmin.tbTenantAdminUserId,
+      deviceId: id,
+      method,
+      params,
+    });
+
+    res.json({ success: true, result });
   } catch (e: any) {
     const status = e?.response?.status ?? 500;
     const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
@@ -724,7 +1138,7 @@ app.get("/api/sensors", authenticateToken, async (req, res) => {
     
     // Return in the format expected by frontend
     res.json({
-      data: sensors,
+      data: sensors.map(toFrontendSensor),
       totalPages: 1,
       totalElements: sensors.length,
       hasNext: false
@@ -745,9 +1159,15 @@ app.post("/api/sensors", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { name, deviceId, deviceName, sensorTypeId, pinConfiguration, outputConfiguration } = req.body;
-    if (!name || !deviceId || !sensorTypeId) {
-      return res.status(400).json({ error: "Name, deviceId, and sensorTypeId are required" });
+    const { name, deviceId, deviceName, label, sensorTypeId, type, pinConfiguration, pinMapping, outputConfiguration, outputConfig, outputTemplate, isActive, additionalInfo } = req.body ?? {};
+    const resolvedSensorTypeId = await resolveSensorTypeId({
+      sensorTypeId,
+      type,
+      sensorTypeName: additionalInfo?.sensorType,
+    });
+
+    if (!name || !deviceId || !resolvedSensorTypeId) {
+      return res.status(400).json({ error: "Name, deviceId, and sensor type are required" });
     }
 
     const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
@@ -756,10 +1176,12 @@ app.post("/api/sensors", authenticateToken, async (req, res) => {
       data: {
         name,
         deviceId,
-        deviceName,
-        sensorTypeId,
-        pinMapping: pinConfiguration || {},
-        outputConfig: outputConfiguration || {},
+        deviceName: deviceName || label || String(deviceId),
+        sensorTypeId: resolvedSensorTypeId,
+        pinMapping: pinConfiguration || pinMapping || additionalInfo?.pinConfig || {},
+        outputConfig: outputConfiguration || outputConfig || additionalInfo?.outputConfig || {},
+        outputTemplate: outputTemplate || additionalInfo?.outputFormat || null,
+        isActive: isActive ?? additionalInfo?.enabled ?? true,
         tenantId: ensured.tenant.id
       },
       include: { 
@@ -767,7 +1189,7 @@ app.post("/api/sensors", authenticateToken, async (req, res) => {
       }
     });
     
-    res.json({ sensor });
+    res.json({ sensor: toFrontendSensor(sensor) });
   } catch (e: any) {
     const status = 500;
     const body = { error: e?.message ?? "Unknown error" };
@@ -784,20 +1206,51 @@ app.put("/api/sensors/:id", authenticateToken, async (req, res) => {
     }
 
     const { id } = req.params;
-    const { name, deviceId, deviceName, sensorTypeId, pinMapping, outputConfig, outputTemplate, isActive } = req.body;
+    const {
+      name,
+      deviceId,
+      deviceName,
+      label,
+      sensorTypeId,
+      type,
+      pinMapping,
+      pinConfiguration,
+      outputConfig,
+      outputConfiguration,
+      outputTemplate,
+      isActive,
+      additionalInfo,
+    } = req.body ?? {};
     
     const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
 
     // Build update data object with only provided fields
     const updateData: any = {};
+    const resolvedSensorTypeId = await resolveSensorTypeId({
+      sensorTypeId,
+      type,
+      sensorTypeName: additionalInfo?.sensorType,
+    });
+
     if (name !== undefined) updateData.name = name;
     if (deviceId !== undefined) updateData.deviceId = deviceId;
-    if (deviceName !== undefined) updateData.deviceName = deviceName;
-    if (sensorTypeId !== undefined) updateData.sensorTypeId = sensorTypeId;
-    if (pinMapping !== undefined) updateData.pinMapping = pinMapping;
-    if (outputConfig !== undefined) updateData.outputConfig = outputConfig;
-    if (outputTemplate !== undefined) updateData.outputTemplate = outputTemplate;
-    if (isActive !== undefined) updateData.isActive = isActive;
+    if (deviceName !== undefined || label !== undefined) updateData.deviceName = deviceName ?? label;
+    if (resolvedSensorTypeId) updateData.sensorTypeId = resolvedSensorTypeId;
+
+    const resolvedPinMapping = pinMapping ?? pinConfiguration ?? additionalInfo?.pinConfig;
+    if (resolvedPinMapping !== undefined) updateData.pinMapping = resolvedPinMapping;
+
+    const resolvedOutputConfig = outputConfig ?? outputConfiguration ?? additionalInfo?.outputConfig;
+    if (resolvedOutputConfig !== undefined) updateData.outputConfig = resolvedOutputConfig;
+
+    const resolvedOutputTemplate = outputTemplate ?? additionalInfo?.outputFormat;
+    if (resolvedOutputTemplate !== undefined) updateData.outputTemplate = resolvedOutputTemplate;
+
+    if (isActive !== undefined) {
+      updateData.isActive = isActive;
+    } else if (additionalInfo?.enabled !== undefined) {
+      updateData.isActive = additionalInfo.enabled;
+    }
 
     const sensor = await prisma.sensor.update({
       where: { 
@@ -810,7 +1263,7 @@ app.put("/api/sensors/:id", authenticateToken, async (req, res) => {
       }
     });
     
-    res.json({ sensor });
+    res.json({ sensor: toFrontendSensor(sensor) });
   } catch (e: any) {
     const status = 500;
     const body = { error: e?.message ?? "Unknown error" };
@@ -840,6 +1293,39 @@ app.delete("/api/sensors/:id", authenticateToken, async (req, res) => {
   } catch (e: any) {
     const status = 500;
     const body = { error: e?.message ?? "Unknown error" };
+    res.status(status).json(body);
+  }
+});
+
+app.get("/api/sensors/:id/details", authenticateToken, async (req, res) => {
+  try {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: "Sensor id is required" });
+
+    const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
+    const sensor = await prisma.sensor.findFirst({
+      where: {
+        id,
+        tenantId: ensured.tenant.id,
+      },
+      include: {
+        sensorType: { include: { outputs: true } },
+      },
+    });
+
+    if (!sensor) {
+      return res.status(404).json({ error: "Sensor not found" });
+    }
+
+    res.json(toFrontendSensor(sensor));
+  } catch (e: any) {
+    const status = e?.response?.status ?? 500;
+    const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
     res.status(status).json(body);
   }
 });
@@ -1062,6 +1548,107 @@ async function tenantRequest<T>(cfg: { method: "GET" | "POST" | "DELETE"; url: s
   return res.data;
 }
 
+// Compatibility endpoint for frontend telemetry API:
+// supports /api/telemetry?deviceId=...&startTime=...&endTime=...
+app.get("/api/telemetry", async (req, res) => {
+  try {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
+      return res.status(401).json({ error: "Missing authentication headers" });
+    }
+
+    const startTs = Number(parseQueryString(req.query.startTs) ?? parseQueryString(req.query.startTime) ?? Date.now() - 24 * 60 * 60 * 1000);
+    const endTs = Number(parseQueryString(req.query.endTs) ?? parseQueryString(req.query.endTime) ?? Date.now());
+    const keysCsv = parseQueryString(req.query.keys) ?? "temperature,humidity";
+    const intervalRaw = parseQueryString(req.query.interval);
+    const aggRaw = parseQueryString(req.query.agg) ?? parseQueryString(req.query.aggregation);
+
+    const deviceIdValues = req.query.deviceId;
+    const deviceIds: string[] = [];
+    if (Array.isArray(deviceIdValues)) {
+      deviceIdValues.forEach((id) => {
+        if (typeof id === "string" && id.trim()) deviceIds.push(id.trim());
+      });
+    } else if (typeof deviceIdValues === "string" && deviceIdValues.trim()) {
+      deviceIds.push(deviceIdValues.trim());
+    }
+    const deviceIdsCsv = parseQueryString(req.query.deviceIds);
+    if (deviceIdsCsv) {
+      deviceIdsCsv.split(",").map((v) => v.trim()).filter(Boolean).forEach((id) => deviceIds.push(id));
+    }
+
+    if (deviceIds.length === 0) {
+      return res.json({ data: [] });
+    }
+
+    const keys = keysCsv.split(",").map((k) => k.trim()).filter(Boolean);
+    const interval = intervalRaw ? Number(intervalRaw) : undefined;
+    const agg = aggRaw ? aggRaw.toUpperCase() : undefined;
+
+    const rowsPerDevice = await Promise.all(
+      deviceIds.map(async (deviceId) => {
+        const raw = interval && agg
+          ? await getAggregatedTelemetry(
+              deviceId,
+              keys,
+              startTs,
+              endTs,
+              interval,
+              agg as "MIN" | "MAX" | "AVG" | "SUM" | "COUNT"
+            )
+          : await getTelemetryHistory(deviceId, keys, startTs, endTs);
+        return normalizeTelemetryRows(deviceId, raw);
+      })
+    );
+
+    const data = rowsPerDevice.flat().sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+    res.json({ data });
+  } catch (e: any) {
+    const status = e?.response?.status ?? 500;
+    const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
+    res.status(status).json(body);
+  }
+});
+
+// Compatibility endpoint for dashboard chart API:
+// /api/telemetry/:deviceId/history?startTime=...&endTime=...&keys=...
+app.get("/api/telemetry/:deviceId/history", async (req, res) => {
+  try {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
+      return res.status(401).json({ error: "Missing authentication headers" });
+    }
+
+    const { deviceId } = req.params;
+    const startTs = Number(parseQueryString(req.query.startTs) ?? parseQueryString(req.query.startTime) ?? Date.now() - 24 * 60 * 60 * 1000);
+    const endTs = Number(parseQueryString(req.query.endTs) ?? parseQueryString(req.query.endTime) ?? Date.now());
+    const keysCsv = parseQueryString(req.query.keys) ?? "temperature,humidity";
+    const intervalRaw = parseQueryString(req.query.interval);
+    const aggRaw = parseQueryString(req.query.agg) ?? parseQueryString(req.query.aggregation);
+
+    const keys = keysCsv.split(",").map((k) => k.trim()).filter(Boolean);
+    const interval = intervalRaw ? Number(intervalRaw) : undefined;
+    const agg = aggRaw ? aggRaw.toUpperCase() : undefined;
+
+    const raw = interval && agg
+      ? await getAggregatedTelemetry(
+          deviceId,
+          keys,
+          startTs,
+          endTs,
+          interval,
+          agg as "MIN" | "MAX" | "AVG" | "SUM" | "COUNT"
+        )
+      : await getTelemetryHistory(deviceId, keys, startTs, endTs);
+
+    res.json({ data: normalizeTelemetryRows(deviceId, raw) });
+  } catch (e: any) {
+    const status = e?.response?.status ?? 500;
+    const body = e?.response?.data ?? { error: e?.message ?? "Unknown error" };
+    res.status(status).json(body);
+  }
+});
+
 // Latest telemetry for all sensors in tenant
 app.get("/api/telemetry/latest", async (req, res) => {
   try {
@@ -1136,21 +1723,21 @@ app.get("/api/telemetry/latest", async (req, res) => {
 
 app.get("/api/telemetry/history", async (req, res) => {
   try {
-    const userSub = req.header("x-user-sub");
-    const userEmail = req.header("x-user-email");
-    const userName = req.header("x-user-name") ?? undefined;
-
-    if (!userSub || !userEmail) {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
       return res.status(401).json({ error: "Missing authentication headers" });
     }
 
-    const { deviceId, keys, startTs, endTs, interval, agg } = req.query;
+    const { deviceId, keys, interval } = req.query;
+    const startTs = parseQueryString(req.query.startTs) ?? parseQueryString(req.query.startTime);
+    const endTs = parseQueryString(req.query.endTs) ?? parseQueryString(req.query.endTime);
+    const agg = parseQueryString(req.query.agg) ?? parseQueryString(req.query.aggregation);
     
     if (!deviceId || !keys || !startTs || !endTs) {
       return res.status(400).json({ error: "Missing required parameters: deviceId, keys, startTs, endTs" });
     }
 
-    const ensured = await ensureTenantForGoogleUser(userSub, userEmail, userName);
+    await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
     
     let telemetryData;
     const keysArray = (keys as string).split(',');
@@ -1185,11 +1772,8 @@ app.get("/api/telemetry/history", async (req, res) => {
 
 app.get("/api/telemetry/aggregated", async (req, res) => {
   try {
-    const userSub = req.header("x-user-sub");
-    const userEmail = req.header("x-user-email");
-    const userName = req.header("x-user-name") ?? undefined;
-
-    if (!userSub || !userEmail) {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
       return res.status(401).json({ error: "Missing authentication headers" });
     }
 
@@ -1199,7 +1783,7 @@ app.get("/api/telemetry/aggregated", async (req, res) => {
       return res.status(400).json({ error: "Missing required parameters" });
     }
 
-    const ensured = await ensureTenantForGoogleUser(userSub, userEmail, userName);
+    const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
     
     // Get tenant credentials
     const link = await prisma.userTenantLink.findFirstOrThrow({
@@ -1209,14 +1793,14 @@ app.get("/api/telemetry/aggregated", async (req, res) => {
     
     // Use tenant-specific device listing
     const devices = await tenantListDevices({
-      email: userEmail,
+      email: userInfo.email,
       password,
       cacheKey: ensured.tenantAdmin.tbTenantAdminUserId,
       page: 0,
       pageSize: 100
     });
     
-    console.log(`Found ${devices.data.length} devices for tenant ${userEmail}`);
+    console.log(`Found ${devices.data.length} devices for tenant ${userInfo.email}`);
     
     // Filter devices if deviceIds parameter is provided
     let filteredDevices = devices.data;
@@ -1235,7 +1819,7 @@ app.get("/api/telemetry/aggregated", async (req, res) => {
     }
     
     // Get tenant token once for all requests
-    const token = await tenantLogin(userEmail, password, ensured.tenantAdmin.tbTenantAdminUserId);
+    const token = await tenantLogin(userInfo.email, password, ensured.tenantAdmin.tbTenantAdminUserId);
     
     const telemetryPromises = filteredDevices.map(async (device: any) => {
       try {
@@ -1467,11 +2051,8 @@ app.delete("/api/projects/:id", async (req, res) => {
 // Start firmware compilation job
 app.post("/api/compile", async (req, res) => {
   try {
-    const userSub = req.header("x-user-sub");
-    const userEmail = req.header("x-user-email");
-    const userName = req.header("x-user-name") ?? undefined;
-
-    if (!userSub || !userEmail) {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
       return res.status(401).json({ error: "Missing authentication headers" });
     }
 
@@ -1486,7 +2067,7 @@ app.post("/api/compile", async (req, res) => {
     }
 
     // Ensure tenant
-    const ensured = await ensureTenantForGoogleUser(userSub, userEmail, userName);
+    const ensured = await ensureTenantForGoogleUser(userInfo.sub, userInfo.email, userInfo.name);
 
     // Get tenant admin credentials for TB API
     const link = await prisma.userTenantLink.findFirstOrThrow({
@@ -1496,7 +2077,7 @@ app.post("/api/compile", async (req, res) => {
 
     // Get tenant token for OTA upload
     const { tbTenantLogin } = await import("./tbTenant.js");
-    const tbToken = await tbTenantLogin(userEmail, password, ensured.tenantAdmin.tbTenantAdminUserId);
+    const tbToken = await tbTenantLogin(userInfo.email, password, ensured.tenantAdmin.tbTenantAdminUserId);
 
     // Generate Arduino code
     const codeResult = generateArduinoCode(nodes, edges, config);
@@ -1518,21 +2099,34 @@ app.post("/api/compile", async (req, res) => {
       },
     });
 
+    const boardType = resolveCompileFqbn(req.body);
+
+    const firmwareVersion = resolveFirmwareVersion(version);
+
     // Queue compilation job
     const bullJobId = await queueCompilationJob({
       jobId: compileJob.id,
       code: codeResult.code,
-      boardType: "esp32:esp32:doit-devkit-v1",
+      boardType,
       deviceId,
-      version: version || "1.0.0",
+      version: firmwareVersion,
       tbToken,
       tenantId: ensured.tenant.id,
     });
 
     res.json({
       success: true,
+      job: {
+        id: compileJob.id,
+        status: "pending",
+        progress: 5,
+        logs: compileJob.logs,
+        error: null,
+        deviceId: compileJob.deviceId,
+      },
       jobId: compileJob.id,
       bullJobId,
+      version: firmwareVersion,
       validation: codeResult.validation,
     });
 
@@ -1547,10 +2141,8 @@ app.post("/api/compile", async (req, res) => {
 // Get compilation job status
 app.get("/api/compile/:jobId/status", async (req, res) => {
   try {
-    const userSub = req.header("x-user-sub");
-    const userEmail = req.header("x-user-email");
-
-    if (!userSub || !userEmail) {
+    const userInfo = getUserFromRequest(req);
+    if (!userInfo) {
       return res.status(401).json({ error: "Missing authentication headers" });
     }
 
@@ -1570,9 +2162,12 @@ app.get("/api/compile/:jobId/status", async (req, res) => {
       success: true,
       job: {
         id: compileJob.id,
-        status: compileJob.status,
+        status: mapCompileStatusForFrontend(compileJob.status),
+        rawStatus: compileJob.status,
+        progress: mapCompileProgressForFrontend(compileJob.status),
         deviceId: compileJob.deviceId,
         logs: compileJob.logs,
+        error: compileJob.errorMsg,
         errorMsg: compileJob.errorMsg,
         firmware: compileJob.firmware,
         createdAt: compileJob.createdAt,

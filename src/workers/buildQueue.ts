@@ -3,6 +3,7 @@ import { Redis } from 'ioredis';
 import { ArduinoBuilder } from '../compiler/arduinoBuilder';
 import { OtaUploader } from '../compiler/otaUploader';
 import { prisma } from '../server/prisma';
+import path from 'path';
 
 // Job data interface
 export interface CompileJobData {
@@ -33,11 +34,9 @@ export const buildQueue = new Queue('firmware-builds', { connection });
  */
 export class BuildWorker {
   private worker: Worker;
-  private arduinoBuilder: ArduinoBuilder;
   private otaUploader: OtaUploader;
 
   constructor() {
-    this.arduinoBuilder = new ArduinoBuilder();
     this.otaUploader = new OtaUploader();
 
     // Create worker
@@ -73,6 +72,7 @@ export class BuildWorker {
    */
   private async processJob(job: Job<CompileJobData>): Promise<any> {
     const { jobId, code, boardType, deviceId, version, tbToken, tenantId } = job.data;
+    const arduinoBuilder = new ArduinoBuilder();
 
     try {
       // Update job status to 'compiling'
@@ -81,7 +81,7 @@ export class BuildWorker {
 
       // Step 1: Compile Arduino code
       console.log(`📦 Compiling firmware for device ${deviceId}`);
-      const buildResult = await this.arduinoBuilder.compile({
+      const buildResult = await arduinoBuilder.compile({
         code,
         boardType,
       });
@@ -94,16 +94,18 @@ export class BuildWorker {
       await this.updateJobStatus(jobId, 'compiling', buildResult.logs.join('\n'));
       await job.updateProgress(50);
 
-      // Step 2: Copy binary to permanent storage
-      const storageDir = process.env.FIRMWARE_STORAGE_PATH || './public/firmware';
+      // Step 2: Copy binary to permanent storage (grouped by tenant/device)
+      const storageBaseDir = process.env.FIRMWARE_STORAGE_PATH || './public/firmware';
+      const storageDir = path.join(storageBaseDir, this.safePathSegment(tenantId), this.safePathSegment(deviceId));
       const fileName = `firmware-${deviceId}-${version}-${Date.now()}.bin`;
       
       console.log(`💾 Copying firmware to storage: ${fileName}`);
-      const storedBinPath = await this.arduinoBuilder.copyToStorage(
+      const storedBinPath = await arduinoBuilder.copyToStorage(
         buildResult.binPath,
         storageDir,
         fileName
       );
+      const publicFirmwareUrl = this.toPublicFirmwareUrl(storedBinPath, storageBaseDir);
 
       await job.updateProgress(60);
 
@@ -126,20 +128,32 @@ export class BuildWorker {
 
       // Step 4: Upload to ThingsBoard OTA
       console.log(`📤 Uploading firmware to ThingsBoard`);
-      await this.updateJobStatus(jobId, 'uploading', 'Uploading firmware to ThingsBoard...');
+      const otaMode = (process.env.OTA_DELIVERY_MODE || 'THINGSBOARD_UPLOAD').toUpperCase();
+      let otaPackageId = 'manual-external-url';
 
-      const otaResult = await this.otaUploader.uploadAndDeploy({
-        binPath: storedBinPath,
-        deviceId,
-        version,
-        title: `Firmware ${version}`,
-        description: `Auto-generated from Wiring Studio`,
-        tbServer: process.env.THINGSBOARD_BASE_URL!,
-        tbToken,
-      });
+      if (otaMode === 'THINGSBOARD_UPLOAD') {
+        await this.updateJobStatus(jobId, 'uploading', 'Uploading firmware to ThingsBoard...');
 
-      if (!otaResult.success) {
-        throw new Error(otaResult.error || 'OTA upload failed');
+        const otaResult = await this.otaUploader.uploadAndDeploy({
+          binPath: storedBinPath,
+          deviceId,
+          version,
+          title: process.env.OTA_PACKAGE_TITLE || 'Firmware',
+          description: `Auto-generated from Wiring Studio`,
+          tbServer: process.env.THINGSBOARD_BASE_URL!,
+          tbToken,
+        });
+
+        if (!otaResult.success) {
+          throw new Error(otaResult.error || 'OTA upload failed');
+        }
+        otaPackageId = otaResult.packageId || otaPackageId;
+      } else {
+        await this.updateJobStatus(
+          jobId,
+          'uploading',
+          `OTA upload skipped (${otaMode}). Use external URL: ${publicFirmwareUrl || storedBinPath}`
+        );
       }
 
       await job.updateProgress(90);
@@ -149,7 +163,13 @@ export class BuildWorker {
         where: { id: jobId },
         data: {
           status: 'success',
-          logs: [...buildResult.logs, `OTA package ID: ${otaResult.packageId}`].join('\n'),
+          logs: [
+            ...buildResult.logs,
+            `Stored firmware path: ${storedBinPath}`,
+            ...(publicFirmwareUrl ? [`External firmware URL: ${publicFirmwareUrl}`] : []),
+            `OTA mode: ${otaMode}`,
+            `OTA package ID: ${otaPackageId}`,
+          ].join('\n'),
           firmwareId: firmware.id,
         },
       });
@@ -157,14 +177,14 @@ export class BuildWorker {
       await job.updateProgress(100);
 
       // Cleanup temp files
-      await this.arduinoBuilder.cleanup();
+      await arduinoBuilder.cleanup();
 
       console.log(`✅ Job ${jobId} completed successfully`);
 
       return {
         success: true,
         firmwareId: firmware.id,
-        otaPackageId: otaResult.packageId,
+        otaPackageId,
       };
 
     } catch (error: any) {
@@ -174,10 +194,27 @@ export class BuildWorker {
       await this.updateJobStatus(jobId, 'failed', error.message);
 
       // Cleanup temp files
-      await this.arduinoBuilder.cleanup();
+      await arduinoBuilder.cleanup();
 
       throw error;
     }
+  }
+
+  private safePathSegment(input: string): string {
+    return input.replace(/[^a-zA-Z0-9._-]/g, '_');
+  }
+
+  private toPublicFirmwareUrl(storedBinPath: string, storageBaseDir: string): string | null {
+    const publicBase = process.env.FIRMWARE_PUBLIC_BASE_URL?.trim();
+    if (!publicBase) return null;
+
+    const normalizedStorageBase = path.resolve(storageBaseDir);
+    const normalizedStoredPath = path.resolve(storedBinPath);
+    const relativePath = path.relative(normalizedStorageBase, normalizedStoredPath);
+    if (relativePath.startsWith('..')) return null;
+
+    const urlPath = relativePath.split(path.sep).join('/');
+    return `${publicBase.replace(/\/+$/, '')}/${urlPath}`;
   }
 
   /**
